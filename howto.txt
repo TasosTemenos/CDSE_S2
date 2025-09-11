@@ -1,0 +1,5 @@
+How to run this
+1) conda activate cdse-s2
+2) cd "C:\Users\Photogrammetry Lab\PycharmProjects\CDSE_S2"
+3) python multi_tile_down_seasons.py --tiles-file tiles.txt --year 2019 --max-cloud 5 --workers 2 --outdir "D:\esaland_data"
+4) python s2_median_mosaic_2.py --root D:/esaland_data --year 2019 --tiles_txt tiles.txt
