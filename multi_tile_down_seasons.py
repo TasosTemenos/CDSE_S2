@@ -8,7 +8,8 @@ import zipfile
 import time
 import random
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+from tempfile import TemporaryDirectory
 
 import requests
 import pandas as pd
@@ -84,6 +85,15 @@ def normalize_tile(t: str) -> str:
     t = t.strip().upper()
     return t if t.startswith("T") else ("T" + t)
 
+
+def read_tile_file(path: Path) -> list[str]:
+    """Read tile codes separated by commas or whitespace, with optional comments."""
+    tiles = []
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        tiles.extend(line.partition("#")[0].replace(",", " ").split())
+    return list(dict.fromkeys(normalize_tile(tile) for tile in tiles))
+
+
 def parse_tiles(single: str | None, many: list[str] | None, fpath: Path | None) -> list[str]:
     tiles: set[str] = set()
     if single:
@@ -91,15 +101,13 @@ def parse_tiles(single: str | None, many: list[str] | None, fpath: Path | None) 
     if many:
         tiles.update(many)
     if fpath:
-        text = fpath.read_text(encoding="utf-8")
-        for tok in [s for part in text.replace(",", " ").split() for s in [part]]:
-            tiles.add(tok)
+        tiles.update(read_tile_file(fpath))
     if not tiles:
         raise SystemExit("You must provide --tile OR --tiles ... OR --tiles-file.")
     return sorted({normalize_tile(t) for t in tiles if t.strip()})
 
-def odata_url(tile:str, start:dt.datetime, end:dt.datetime, max_cloud:float)->str:
-    f = (
+def odata_filter(tile: str, start: dt.datetime, end: dt.datetime, max_cloud: float) -> str:
+    return (
         "Collection/Name eq 'SENTINEL-2' "
         "and Attributes/OData.CSC.StringAttribute/any(att:att/Name eq 'productType' and att/OData.CSC.StringAttribute/Value eq 'S2MSI2A') "
         f"and ContentDate/Start ge {start.strftime('%Y-%m-%d')}T00:00:00.000Z "
@@ -107,7 +115,11 @@ def odata_url(tile:str, start:dt.datetime, end:dt.datetime, max_cloud:float)->st
         f"and contains(Name,'_{tile}_') "
         f"and Attributes/OData.CSC.DoubleAttribute/any(att: att/Name eq 'cloudCover' and att/OData.CSC.DoubleAttribute/Value le {max_cloud})"
     )
-    params = {"$filter": f, "$orderby": "ContentDate/Start asc", "$top": 200}
+
+
+def odata_url(tile: str, start: dt.datetime, end: dt.datetime, max_cloud: float) -> str:
+    params = {"$filter": odata_filter(tile, start, end, max_cloud),
+              "$orderby": "ContentDate/Start asc", "$top": 200}
     def enc(v:str)->str: return requests.utils.requote_uri(v)
     q = "&".join([f"{k}={enc(str(v))}" for k,v in params.items()])
     return f"{ODATA_BASE}?{q}"
@@ -123,36 +135,37 @@ def search(tile, start, end, max_cloud, auth: CDSEAuth) -> pd.DataFrame:
     return pd.DataFrame(out)
 
 def download(pid: str, name: str, dest_zip: Path, auth: CDSEAuth, progress: bool = True):
-    if dest_zip.exists() and dest_zip.stat().st_size > 1_000_000:
+    if zipfile.is_zipfile(dest_zip):
         return "exists"
     dest_zip.parent.mkdir(parents=True, exist_ok=True)
     url = f"{ZIPPER_BASE}({pid})/$value"
-    r = cdse_request("GET", url, auth, stream=True, timeout=600)
-    total = int(r.headers.get("Content-Length", 0))
-    if progress:
-        with open(dest_zip, "wb") as f, tqdm(total=total, unit="B", unit_scale=True, desc=name) as p:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
-                    f.write(chunk); p.update(len(chunk))
-    else:
-        with open(dest_zip, "wb") as f:
-            for chunk in r.iter_content(1024 * 1024):
-                if chunk:
+    with TemporaryDirectory(dir=dest_zip.parent) as tmp:
+        partial = Path(tmp) / dest_zip.name
+        with cdse_request("GET", url, auth, stream=True, timeout=600) as r, partial.open("wb") as f:
+            total = int(r.headers.get("Content-Length", 0))
+            with tqdm(total=total or None, unit="B", unit_scale=True, desc=name, disable=not progress) as p:
+                for chunk in r.iter_content(1024 * 1024):
                     f.write(chunk)
-    if dest_zip.stat().st_size < 1_000_000:
-        raise IOError("Downloaded file is unexpectedly small.")
+                    p.update(len(chunk))
+        if not zipfile.is_zipfile(partial):
+            raise IOError("The downloaded response is not a complete ZIP archive.")
+        partial.replace(dest_zip)
     return "downloaded"
 
 def extract(zip_path: Path, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as z:
-        names = z.namelist()
-        roots = [n for n in names if n.endswith(".SAFE/") and n.count("/") == 1]
-        root = roots[0].rstrip("/") if roots else zip_path.stem
+        roots = {name.split("/", 1)[0] for name in z.namelist() if "/" in name}
+        safe_roots = {root for root in roots if root.endswith(".SAFE")}
+        if len(safe_roots) != 1:
+            raise ValueError(f"Expected one top-level .SAFE product in {zip_path}")
+        root = safe_roots.pop()
         safe_path = out_dir / root
         if safe_path.exists():
             return safe_path
-        z.extractall(out_dir)
+        with TemporaryDirectory(dir=out_dir) as tmp:
+            z.extractall(tmp)
+            (Path(tmp) / root).rename(safe_path)
         return safe_path
 
 def main():
@@ -171,51 +184,50 @@ def main():
     args = ap.parse_args()
 
     tiles = parse_tiles(args.tile, args.tiles, args.tiles_file)
-    user = args.username or input("CDSE username (email): ")
-    pw = args.password or getpass.getpass("CDSE password: ")
+    download_seasons(tiles, args.year, args.outdir, args.max_cloud,
+                     args.username, args.password, args.workers)
+
+
+def download_seasons(tiles, year, outdir, max_cloud, username=None, password=None,
+                     workers=1) -> dict[tuple[str, str], list[Path]]:
+    user = username or input("CDSE username (email): ")
+    pw = password or getpass.getpass("CDSE password: ")
     auth = CDSEAuth(user, pw)
 
-    print(f"Tiles: {', '.join(tiles)} | Year: {args.year} | Max cloud: {args.max_cloud}% | Workers: {args.workers}")
+    print(f"Tiles: {', '.join(tiles)} | Year: {year} | Max cloud: {max_cloud}% | Workers: {workers}")
 
+    products = {}
     for tile in tiles:
         print(f"\n========== Tile {tile} ==========")
-        for label, start, end in SEASONS(args.year):
+        for label, start, end in SEASONS(year):
             print(f"=== {label}: {start.date()} -> {end.date()} ===")
-            df = search(tile, start, end, args.max_cloud, auth)
+            df = search(tile, start, end, max_cloud, auth)
             print(f"Found {len(df)} products.")
             if df.empty:
                 continue
 
-            season_dir = args.outdir / f"{args.year}" / tile / label
+            season_dir = outdir / str(year) / tile / label
             raw_dir = season_dir / "raw"
             safe_dir = season_dir / "SAFE"
 
-            if args.workers <= 1:
-                for _, row in df.iterrows():
-                    pid = row.get("Id"); name = row.get("Name")
-                    z = raw_dir / f"{name}.zip"
-                    try:
-                        download(pid, name, z, auth, progress=True)
-                        extract(z, safe_dir)
-                    except Exception as e:
-                        print(f"Warning: failed {name}: {e}")
-            else:
-                def job(row):
-                    pid = row.get("Id"); name = row.get("Name")
-                    z = raw_dir / f"{name}.zip"
-                    try:
-                        download(pid, name, z, auth, progress=False)
-                        extract(z, safe_dir)
-                        return (name, "ok")
-                    except Exception as e:
-                        return (name, f"err: {e}")
+            def job(row):
+                pid, name = row["Id"], row["Name"]
+                archive = raw_dir / f"{name}.zip"
+                try:
+                    download(pid, name, archive, auth, progress=workers <= 1)
+                    return extract(archive, safe_dir)
+                except Exception as exc:
+                    print(f"Warning: failed {name}: {exc}")
+                    return None
 
-                with ThreadPoolExecutor(max_workers=args.workers) as ex:
-                    futures = [ex.submit(job, row) for _, row in df.iterrows()]
-                    for fut in as_completed(futures):
-                        name, status = fut.result()
-                        if status != "ok":
-                            print(f"Warning: {name} -> {status}")
+            rows = df.drop_duplicates(subset="Name").to_dict("records")
+            if workers <= 1:
+                paths = list(map(job, rows))
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    paths = list(ex.map(job, rows))
+            products[tile, label] = [path for path in paths if path is not None]
+    return products
 
 if __name__ == "__main__":
     main()

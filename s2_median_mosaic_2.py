@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 from typing import List, Dict, Optional
-from osgeo import gdal  # kept as requested
 
 from collections import defaultdict
 
@@ -11,6 +10,8 @@ import numpy as np
 import xarray as xr
 import rioxarray as rxr
 from rasterio.enums import Resampling
+
+from multi_tile_down_seasons import normalize_tile, read_tile_file
 
 # -------- configuration --------
 BANDS_10M = ["B02", "B03", "B04", "B08"]
@@ -67,27 +68,27 @@ def find_scl_in_granule(granule_path: Path) -> Optional[Path]:
 # -------- IO / reprojection --------
 def open_ref_da(b02_path: Path) -> xr.DataArray:
     """Open reference B02 as a single-band DataArray with spatial chunks."""
-    da = rxr.open_rasterio(
+    with rxr.open_rasterio(
         b02_path,
         chunks={"band": 1, "x": CHUNK_X, "y": CHUNK_Y}
-    ).squeeze("band", drop=True)
-    if da.rio.crs is None:
-        raise ValueError(f"No CRS found in {b02_path}")
-    return da.chunk({"x": CHUNK_X, "y": CHUNK_Y})
+    ) as source:
+        if source.rio.crs is None:
+            raise ValueError(f"No CRS found in {b02_path}")
+        return source.squeeze("band", drop=True)
 
 
 def reproject_to_ref(path: Path, ref: xr.DataArray, resampling: Resampling) -> xr.DataArray:
     """Open a file and reproject/align to the reference grid."""
-    da = rxr.open_rasterio(
-        path,
+    with rxr.open_rasterio(
+        path, masked=True,
         chunks={"band": 1, "x": CHUNK_X, "y": CHUNK_Y}
-    ).squeeze("band", drop=True)
-    da = da.rio.reproject_match(ref, resampling=resampling)
+    ) as source:
+        da = source.squeeze("band", drop=True).rio.reproject_match(ref, resampling=resampling)
     return da.chunk({"x": CHUNK_X, "y": CHUNK_Y})
 
 
 # -------- inventory (optimization #2) --------
-def build_scene_inventory(season_safe_dir: Path) -> Dict[str, Dict[str, Path]]:
+def build_scene_inventory(safe_roots: List[Path]) -> Dict[str, Dict[str, Path]]:
     """
     Build a per-season inventory of available scenes (granules) and their band file paths.
     Returns:
@@ -97,11 +98,11 @@ def build_scene_inventory(season_safe_dir: Path) -> Dict[str, Dict[str, Path]]:
 
     # Collect band files per granule
     for b in ALL_BANDS:
-        for p in find_band_files(season_safe_dir, b):
-            gk = granule_key(p)
-            if gk is None:
-                continue
-            inv[gk][b] = p
+        for root in safe_roots:
+            for p in find_band_files(root, b):
+                gk = granule_key(p)
+                if gk is not None:
+                    inv[gk][b] = p
 
     # Collect SCL once per granule
     for gk in list(inv.keys()):
@@ -117,21 +118,24 @@ def build_scene_inventory(season_safe_dir: Path) -> Dict[str, Dict[str, Path]]:
 def build_season_median(
     season_safe_dir: Path,
     out_tif: Path,
-    nodata_val: int
+    nodata_val: int,
+    *,
+    scaled: bool = False,
+    products: Optional[List[Path]] = None,
 ) -> None:
     """
     Build a 7-band (B02,B03,B04,B08,B8A,B11,B12) seasonal median mosaic at 10 m,
     masked by SCL invalid classes, and write as uint16 with nodata.
     """
     # Build inventory once (scenes -> band paths + SCL)
-    inv = build_scene_inventory(season_safe_dir)
+    inv = build_scene_inventory([season_safe_dir] if products is None else products)
     if not inv:
         print(f"[WARN] No scenes found in {season_safe_dir}; skipping.")
         return
 
     # Choose reference grid from the first scene that has B02
     ref_b02_path: Optional[Path] = None
-    for gk, items in inv.items():
+    for items in inv.values():
         if "B02" in items:
             ref_b02_path = items["B02"]
             break
@@ -140,32 +144,21 @@ def build_season_median(
         return
     ref = open_ref_da(ref_b02_path)
 
-    # Per-granule SCL cache (optimization #1)
-    scl_cache: Dict[str, Optional[xr.DataArray]] = {}
-
     # Collect per-band stacks (each element is one scene)
     band_stacks: Dict[str, List[xr.DataArray]] = {b: [] for b in ALL_BANDS}
     scl_mask_values_list = list(SCL_MASK_VALUES)  # avoid recreating each time
 
     # Iterate scenes; for each band present, reproject & mask (reuse SCL per scene)
     for gk, items in inv.items():
-        # Prepare SCL mask once per scene (if SCL exists)
         scl_mask = None
-        if "SCL" in items:
-            if gk not in scl_cache:
-                try:
-                    scl_reproj = reproject_to_ref(items["SCL"], ref, Resampling.nearest)
-                except Exception as e:
-                    print(f"[INFO] SCL reprojection failed for scene {gk}: {e}")
-                    scl_reproj = None
-                scl_cache[gk] = scl_reproj
-            scl_reproj = scl_cache[gk]
-            if scl_reproj is not None:
-                try:
-                    scl_mask = scl_reproj.isin(scl_mask_values_list)  # True where cloudy/invalid
-                except Exception as e:
-                    print(f"[INFO] SCL mask creation failed for scene {gk}: {e}")
-                    scl_mask = None
+        try:
+            scl = reproject_to_ref(items["SCL"], ref, Resampling.nearest)
+            scl_mask = scl.isnull() | scl.isin(scl_mask_values_list)
+        except Exception as exc:
+            if scaled:
+                print(f"[WARN] Skipping scene without a usable SCL mask: {gk} ({exc})")
+                continue
+            print(f"[WARN] Using unmasked scene {gk}: {exc}")
 
         # Reproject/append each band available in this scene
         for band in ALL_BANDS:
@@ -200,55 +193,35 @@ def build_season_median(
 
     # enforce EXACT 7 bands and correct order
     ordered = []
-    for b in ["B02", "B03", "B04", "B08", "B8A", "B11", "B12"]:
+    for b in ALL_BANDS:
         if b in med_map:
             ordered.append(med_map[b])
         else:
             ordered.append(xr.full_like(ref, np.nan, dtype="float32"))
 
-    out = xr.concat(ordered, dim="band").assign_coords({"band": np.arange(1, 8)})
+    out = xr.concat(ordered, dim="band").assign_coords({"band": np.arange(1, len(ALL_BANDS) + 1)})
     out = out.rio.write_crs(ref.rio.crs).rio.write_transform(ref.rio.transform())
 
-    # ---- write as uint16 with nodata ----
-    out_u16 = (
-        out.fillna(nodata_val)
-           .round()
-           .clip(min=0, max=65535)
-           .astype("uint16")
-           .rio.write_nodata(nodata_val)
-           .chunk({"band": -1, "x": CHUNK_X, "y": CHUNK_Y})
-    )
+    if scaled:
+        out = (out / 10000).astype("float32").rio.write_nodata(np.nan)
+    else:
+        out = (out.fillna(nodata_val).round().clip(min=0, max=65535)
+               .astype("uint16").rio.write_nodata(nodata_val))
+    out.attrs["long_name"] = tuple(ALL_BANDS)
 
     out_tif.parent.mkdir(parents=True, exist_ok=True)
-    out_u16.rio.to_raster(
+    out.rio.to_raster(
         out_tif,
-        dtype="uint16",
+        dtype=str(out.dtype),
         tiled=True,
         compress="deflate",  # change to "zstd" if your GDAL supports it
-        predictor=2,
+        predictor=3 if scaled else 2,
         BIGTIFF="IF_SAFER",
     )
-    print(f"[OK] Saved {out_tif} (uint16; bands: B02,B03,B04,B08,B8A,B11,B12; nodata={nodata_val})")
+    print(f"[OK] Saved {out_tif} ({out.dtype}; bands: {', '.join(ALL_BANDS)}; nodata={out.rio.nodata})")
 
 
 # -------- multi-tile utils --------
-def read_tiles_from_txt(path: Path) -> List[str]:
-    """
-    Read a text file and extract tile codes.
-    Accepts one per line and/or comma-separated, ignores blanks, de-dupes preserving order.
-    """
-    txt = path.read_text(encoding="utf-8")
-    raw = [t.strip() for t in txt.replace(",", "\n").splitlines()]
-    tiles = [t for t in raw if t]
-    seen = set()
-    ordered: List[str] = []
-    for t in tiles:
-        if t not in seen:
-            seen.add(t)
-            ordered.append(t)
-    return ordered
-
-
 def process_one_tile(root: Path, year: int, tile: str, seasons: List[str], nodata_val: int) -> None:
     for label in seasons:
         season_dir = root / f"{year}" / tile / label
@@ -270,7 +243,7 @@ def main():
     # Either a single tile or a file with many tiles
     mx = ap.add_mutually_exclusive_group(required=True)
     mx.add_argument("--tile", help="Single tile ID (e.g., T34SDJ)")
-    mx.add_argument("--tiles_txt", type=Path,
+    mx.add_argument("--tiles-file", "--tiles_txt", dest="tiles_txt", type=Path,
                     help="Path to a text file with tile IDs (one per line or comma-separated)")
 
     ap.add_argument("--season", choices=SEASON_ORDER,
@@ -281,6 +254,10 @@ def main():
                     help="Nodata value for uint16 output (0 or 65535).")
 
     args = ap.parse_args()
+    if args.chunk < 1:
+        ap.error("--chunk must be positive")
+    if not 0 <= args.nodata <= 65535:
+        ap.error("--nodata must be between 0 and 65535")
 
     CHUNK_X = CHUNK_Y = int(args.chunk)
     NODATA_U16 = int(args.nodata)
@@ -289,9 +266,9 @@ def main():
 
     # Build tile list
     if args.tile:
-        tiles = [args.tile]
+        tiles = [normalize_tile(args.tile)]
     else:
-        tiles = read_tiles_from_txt(args.tiles_txt)
+        tiles = read_tile_file(args.tiles_txt)
         if not tiles:
             raise SystemExit(f"No tiles found in {args.tiles_txt}")
 
